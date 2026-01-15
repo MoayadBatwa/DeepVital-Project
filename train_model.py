@@ -4,114 +4,88 @@ import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, LSTM, Dense, Bidirectional, Attention, GlobalAveragePooling1D, Concatenate, Dropout
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import StandardScaler
+import joblib
 
-# 1. إعداد البيانات (أو توليد محاكاة دقيقة لبيانات Kaggle)
-# -------------------------------------------------------
+# 1. Data Generation (Simulating PhysioNet Sepsis Dataset)
 def load_real_data():
-    # حاول قراءة الملف الحقيقي
     try:
         df = pd.read_csv('clinical_data.csv')
-        print("✅ تم تحميل بيانات Kaggle الحقيقية.")
+        print("Loaded existing data.")
     except FileNotFoundError:
-        print("⚠️ لم يتم العثور على ملف CSV، جاري توليد بيانات واقعية للمحاكاة...")
-        # توليد بيانات تحاكي هيكلية بيانات Sepsis في Kaggle
-        # (3000 مريض، كل مريض لديه 24-50 ساعة)
+        print("Generating synthetic PhysioNet-style data...")
+        # Create 1000 patients with 24 hours of vitals each
         n_patients = 1000
         data = []
         for pid in range(n_patients):
-            hours = 24
-            is_sepsis = np.random.rand() > 0.8 # 20% مرضى خطرين
+            is_sepsis = np.random.rand() > 0.8 # 20% sepsis prevalence
             
+            # Base vitals (Normal distribution)
             base_hr = np.random.normal(80, 10)
             base_sbp = np.random.normal(120, 15)
             
-            for h in range(hours):
-                # إضافة نمط التدهور للمرضى الخطرين
-                trend = (h/hours) if is_sepsis else 0
+            for h in range(24):
+                # Apply deterioration trend if sepsis
+                trend = (h/24) if is_sepsis else 0
                 
                 hr = base_hr + (trend * 30) + np.random.normal(0, 5)
                 sbp = base_sbp - (trend * 20) + np.random.normal(0, 5)
                 o2 = 98 - (trend * 10) + np.random.normal(0, 2)
                 resp = 18 + (trend * 5) + np.random.normal(0, 2)
                 
-                # تفعيل الـ Label في آخر 6 ساعات
+                # Label is 1 only in the last 6 hours of sepsis cases
                 label = 1 if (is_sepsis and h > 18) else 0
                 
-                data.append([pid, h, hr, sbp, o2, resp, label])
+                data.append([pid, hr, sbp, o2, resp, label])
         
-        df = pd.DataFrame(data, columns=['Patient_ID', 'Hour', 'HR', 'SBP', 'O2Sat', 'Resp', 'Label'])
-        df.to_csv('clinical_data.csv', index=False) # حفظها كملف لتستخدمه لاحقاً
-    
+        df = pd.DataFrame(data, columns=['Patient_ID', 'HR', 'SBP', 'O2Sat', 'Resp', 'Label'])
+        df.to_csv('clinical_data.csv', index=False)
     return df
 
-# 2. معالجة البيانات (أصعب مرحلة في البيانات الحقيقية)
-# تحويل الجدول المسطح إلى (Samples, TimeSteps, Features)
-# -------------------------------------------------------
+# 2. Preprocessing
 def preprocess_data(df, time_steps=24):
-    print("⏳ جاري معالجة البيانات وتحويلها لسلاسل زمنية...")
-    
-    # ملء القيم المفقودة (شائع جداً في البيانات الحقيقية)
-    df = df.fillna(method='ffill').fillna(method='bfill')
-    
     grouped = df.groupby('Patient_ID')
-    X = []
-    y = []
-    
+    X, y = [], []
     for _, group in grouped:
-        # نأخذ آخر 24 ساعة لكل مريض
         if len(group) >= time_steps:
-            # الخصائص: HR, SBP, O2Sat, Resp
+            # Extract last 24h vitals
             vitals = group[['HR', 'SBP', 'O2Sat', 'Resp']].values[-time_steps:]
-            # النتيجة: هل المريض مصاب في آخر ساعة؟
             label = group['Label'].values[-1]
-            
             X.append(vitals)
             y.append(label)
-            
-    X = np.array(X)
-    y = np.array(y)
-    return X, y
+    return np.array(X), np.array(y)
 
-# تنفيذ التحميل والمعالجة
+# Load and Process
 df = load_real_data()
 X, y = preprocess_data(df)
 
-# تحجيم البيانات (Scaling)
+# Scale features (Critical for Neural Networks)
 scaler = StandardScaler()
-# نحتاج تحويلها لـ 2D للتحجيم ثم إعادتها لـ 3D
-X_reshaped = X.reshape(-1, 4)
-X_scaled = scaler.fit_transform(X_reshaped).reshape(-1, 24, 4)
+X_scaled = scaler.fit_transform(X.reshape(-1, 4)).reshape(-1, 24, 4)
 
-# تقسيم البيانات
+# Split Train/Test
 X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 
-print(f"Dataset Shape: {X_train.shape}")
-
-# 3. بناء وتدريب النموذج (نفس المعمارية القوية)
-# -------------------------------------------------------
+# 3. Model Architecture (Bi-LSTM + Attention)
 inputs = Input(shape=(24, 4))
+# Bi-LSTM to understand temporal context (past & future context)
 lstm_out = Bidirectional(LSTM(64, return_sequences=True))(inputs)
-attention_layer = Attention(name='attention_weight')
-context_vector = attention_layer([lstm_out, lstm_out])
-concatenated = Concatenate()([lstm_out, context_vector])
-gap = GlobalAveragePooling1D()(concatenated)
+# Attention to focus on critical time steps
+attention = Attention()([lstm_out, lstm_out])
+# Merge and simplify
+concat = Concatenate()([lstm_out, attention])
+gap = GlobalAveragePooling1D()(concat)
 x = Dense(32, activation='relu')(gap)
-x = Dropout(0.3)(x)
+x = Dropout(0.3)(x) # Prevent overfitting
 outputs = Dense(1, activation='sigmoid')(x)
 
 model = Model(inputs=inputs, outputs=outputs)
-model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy', 'AUC'])
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 
-print("🚀 بدء تدريب النموذج على البيانات...")
-model.fit(X_train, y_train, epochs=10, batch_size=32, validation_data=(X_test, y_test))
+# 4. Train and Save
+print("Training model...")
+model.fit(X_train, y_train, epochs=10, batch_size=32, verbose=1)
 
-# 4. حفظ النموذج والمعالج
-# -------------------------------------------------------
 model.save('deepvital_model.h5')
-print("✅ تم حفظ الموديل بنجاح باسم: deepvital_model.h5")
-
-# حفظ الـ Scaler لنستخدمه في التطبيق (مهم جداً لتكون الأرقام متناسقة)
-import joblib
 joblib.dump(scaler, 'scaler.pkl')
-print("✅ تم حفظ الـ Scaler.")
+print("Model and Scaler saved successfully.")
